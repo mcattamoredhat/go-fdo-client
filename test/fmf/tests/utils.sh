@@ -346,6 +346,19 @@ verify_exit_code() {
 # TEST UTILITIES
 #==============================================================================
 
+reset_fdo_databases() {
+    log_info "Stopping FDO services and wiping databases for a clean run..."
+    sudo systemctl stop \
+        go-fdo-server-manufacturer.service \
+        go-fdo-server-rendezvous.service \
+        go-fdo-server-owner.service 2>/dev/null || true
+    sudo rm -f \
+        /var/lib/go-fdo-server-manufacturer/db.sqlite* \
+        /var/lib/go-fdo-server-rendezvous/db.sqlite* \
+        /var/lib/go-fdo-server-owner/db.sqlite*
+    log_info "Databases wiped"
+}
+
 cleanup_test_files() {
     local cred_file=$1
     local voucher_file=$2
@@ -371,5 +384,82 @@ wait_for_ssh() {
 
   log_error "SSH connection timed out after $((max_attempts * 10)) seconds"
   return 1
+}
+
+#==============================================================================
+# INSTALLATION FUNCTIONS
+#==============================================================================
+
+# Install go-fdo-client from a brew/koji URL, a local RPM path,
+# or fall back to the @fedora-iot/fedora-iot COPR.
+#
+# Environment variables (choose one):
+#   BREW_CLIENT_URL  - direct URL to a brew/koji RPM
+#                      e.g. https://kojipkgs.fedoraproject.org/packages/go-fdo-client/...rpm
+#                      TLS verification is skipped (brew servers use self-signed certs)
+#   CLIENT_RPM_PATH  - absolute path to a local RPM file
+#   (neither set)    - install from @fedora-iot/fedora-iot COPR
+install_client() {
+    if [[ -n "${BREW_CLIENT_URL:-}" ]]; then
+        log_info "Installing go-fdo-client from brew URL: ${BREW_CLIENT_URL}"
+        sudo dnf install -y --setopt=sslverify=0 "${BREW_CLIENT_URL}"
+    elif [[ -n "${CLIENT_RPM_PATH:-}" ]]; then
+        log_info "Installing go-fdo-client from local RPM: ${CLIENT_RPM_PATH}"
+        sudo dnf install -y "${CLIENT_RPM_PATH}"
+    else
+        log_info "Installing go-fdo-client from @fedora-iot/fedora-iot COPR..."
+        rpm -q --whatprovides 'dnf-command(copr)' &>/dev/null || sudo dnf install -y 'dnf-command(copr)'
+        sudo dnf copr enable -y '@fedora-iot/fedora-iot'
+        sudo dnf install -y \
+            --disablerepo=* \
+            --enablerepo=copr:copr.fedorainfracloud.org:group_fedora-iot:fedora-iot \
+            go-fdo-client
+        sudo dnf copr disable -y '@fedora-iot/fedora-iot'
+    fi
+}
+
+# Install go-fdo-server sub-packages from a brew/koji URL or the @fedora-iot/fedora-iot COPR.
+#
+# Environment variables (choose one):
+#   BREW_SERVER_URL  - direct URL to a brew/koji go-fdo-server RPM
+#                      e.g. https://<node>/brewroot/vol/rhel-10/packages/go-fdo-server/<ver>/<rel>/x86_64/go-fdo-server-<ver>-<rel>.x86_64.rpm
+#                      TLS verification is skipped (brew servers use self-signed certs)
+#   (not set)        - install from @fedora-iot/fedora-iot COPR
+install_server() {
+    if [[ -n "${BREW_SERVER_URL:-}" ]]; then
+        # Derive sub-package URLs from the main x86_64 package URL.
+        # Sub-packages (manufacturer, rendezvous, owner) are noarch and live
+        # in the noarch/ subdirectory of the same NVR tree.
+        local noarch_base filename vr
+        noarch_base="${BREW_SERVER_URL%x86_64/*}noarch"
+        filename=$(basename "${BREW_SERVER_URL}")
+        vr="${filename#go-fdo-server-}"
+        vr="${vr%.x86_64.rpm}"
+        log_info "Installing go-fdo-server packages from brew (VR: ${vr})..."
+        sudo dnf install -y --setopt=sslverify=0 \
+            "${BREW_SERVER_URL}" \
+            "${noarch_base}/go-fdo-server-manufacturer-${vr}.noarch.rpm" \
+            "${noarch_base}/go-fdo-server-rendezvous-${vr}.noarch.rpm" \
+            "${noarch_base}/go-fdo-server-owner-${vr}.noarch.rpm"
+    else
+        log_info "Installing go-fdo-server packages from @fedora-iot/fedora-iot COPR..."
+        rpm -q --whatprovides 'dnf-command(copr)' &>/dev/null || sudo dnf install -y 'dnf-command(copr)'
+        . /etc/os-release
+        if [[ "${ID}" = "centos" ]]; then
+            sudo dnf copr enable -y '@fedora-iot/fedora-iot' "${ID}-stream-${VERSION_ID}"
+        else
+            sudo dnf copr enable -y '@fedora-iot/fedora-iot'
+        fi
+        sudo dnf install -y \
+            --disablerepo=* \
+            --enablerepo=copr:copr.fedorainfracloud.org:group_fedora-iot:fedora-iot \
+            go-fdo-server \
+            go-fdo-server-manufacturer \
+            go-fdo-server-rendezvous \
+            go-fdo-server-owner
+        sudo dnf copr disable -y '@fedora-iot/fedora-iot'
+    fi
+    # sqlite is in the standard RHEL/Fedora AppStream repo, not in the COPR or brew
+    sudo dnf install -y sqlite
 }
 
